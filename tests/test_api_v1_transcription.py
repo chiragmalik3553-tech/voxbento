@@ -1,159 +1,350 @@
 """
-Tests for the /api/v1 transcription control endpoints.
+Tests for the /api/v1 transcription control routes.
+
+Every request to start, stop and status used to fail with a TypeError and come
+back as a 500, so each route is driven over HTTP here and asserted on its
+status code.
 
 Covers:
-- Booth ID is built from event slug, room and language
-- Worker receives the booth's configured provider, model and key
-- Booth missing from the in-memory registry
-- Transcription disabled on the booth
-- Stop targets the room-scoped booth
+- Start returns 200 and hands the worker a room-scoped booth ID
+- Start rejects a booth that is not live, not enabled or missing a key
+- Stop returns 200 and targets the room-scoped booth
+- Status reports liveness and whether a worker is actually running
+- Event scoping and RBAC on all three routes
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import hashlib
+import os
+from datetime import datetime, timedelta, timezone
+
+os.environ["BOOTH_ACCESS_TOKEN"] = ""
 
 import pytest
-from fastapi import HTTPException
 
 from portal.globals import booths
-from portal.routers import api_v1
 
 EVENT_SLUG = "pycon2026"
-ROOM_ID = 14
-
-
-def make_event(**overrides):
-    """Build a stand-in Event row, with any field overridden by keyword."""
-    event = SimpleNamespace(id=1, slug=EVENT_SLUG, transcription_api_enabled=False)
-    event.__dict__.update(overrides)
-    return event
-
-
-def make_booth(**overrides):
-    """Build a stand-in DBBooth row, with any field overridden by keyword."""
-    booth = SimpleNamespace(transcription_enabled=True, transcription_provider="local", transcription_model="tiny")
-    booth.__dict__.update(overrides)
-    return booth
-
-
-class FakeSession:
-    """Stands in for AsyncSession: hands back queued rows in query order."""
-
-    def __init__(self, *rows):
-        """Queue the rows to hand back, one per query."""
-        self._rows = list(rows)
-
-    async def execute(self, _stmt):
-        """Return the next queued row wrapped the way scalars().first() expects."""
-        row = self._rows.pop(0) if self._rows else None
-        return SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: row))
-
-    async def scalar(self, _stmt):
-        """Return the next queued row directly."""
-        return self._rows.pop(0) if self._rows else None
+ACCESS_TOKEN = "test-oauth-access-token"
+SCOPES = ["sessions:manage", "sessions:read"]
 
 
 @pytest.fixture(autouse=True)
-def skip_rbac(monkeypatch):
-    """The OAuth/RBAC gate is covered elsewhere; these tests exercise the body."""
+async def setup_db():
+    """Set up an in-memory database for the FastAPI app."""
+    from portal.database import configure, dispose, init_db
 
-    async def allow(*_args, **_kwargs):
-        """Let every caller through."""
-        return None
-
-    monkeypatch.setattr(api_v1, "_verify_token_rbac", allow)
-
-
-@pytest.fixture
-async def live_booth():
-    """Register the booth in the in-memory registry for the duration of a test."""
-    await booths.create_booth(EVENT_SLUG, "en", "English", ROOM_ID)
+    configure("sqlite+aiosqlite://")
+    await init_db()
     yield
-    await booths.remove_booth(EVENT_SLUG, ROOM_ID, "en")
+    await dispose()
+
+
+@pytest.fixture(autouse=True)
+def clear_registry():
+    """Keep the in-memory booth registry from leaking between tests."""
+    from portal.transcription.worker import active_workers
+
+    booths._booths.clear()
+    active_workers.clear()
+    yield
+    booths._booths.clear()
+    active_workers.clear()
 
 
 @pytest.fixture
-def token():
-    """Return an OAuth token scoped to the seeded event."""
-    return SimpleNamespace(event_id=1, user_id=1)
+async def seed():
+    """Seed an event, a room, a transcription-enabled booth and an OAuth token."""
+    from portal.database import create_booth, create_event, create_room, get_session
+    from portal.models import DeveloperAccount, EventMembership, OAuthClient, OAuthToken, User
+
+    async with get_session() as s:
+        event = await create_event(s, slug=EVENT_SLUG, display_name="PyCon 2026")
+        room = await create_room(s, event_id=event.id, display_name="Main Hall")
+        booth = await create_booth(
+            s,
+            event_id=event.id,
+            room_id=room.id,
+            language_code="en",
+            language_name="English",
+        )
+        booth.transcription_enabled = True
+        booth.transcription_provider = "local"
+        booth.transcription_model = "tiny"
+
+        user = User(
+            email="owner@example.com",
+            display_name="Event Owner",
+            password_hash="x",
+            is_admin=True,
+        )
+        s.add(user)
+        await s.flush()
+
+        # _verify_token_rbac only accepts a super admin or an event owner
+        s.add(EventMembership(user_id=user.id, event_id=event.id, role="event_owner"))
+
+        account = DeveloperAccount(user_id=user.id, status="approved")
+        s.add(account)
+        await s.flush()
+
+        client = OAuthClient(
+            developer_account_id=account.id,
+            client_id="test-client",
+            client_secret_hash="x",
+            name="Eventyay",
+        )
+        s.add(client)
+        await s.flush()
+
+        s.add(
+            OAuthToken(
+                client_id=client.id,
+                user_id=user.id,
+                event_id=event.id,
+                scopes=SCOPES,
+                access_token_hash=hashlib.sha256(ACCESS_TOKEN.encode()).hexdigest(),
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+        )
+        await s.flush()
+        return {"event_id": event.id, "room_id": room.id, "booth_id": booth.id}
+
+
+def client():
+    """Return an ASGI client bound to the real FastAPI app."""
+    from httpx import ASGITransport, AsyncClient
+
+    from fastapi_app import app
+
+    return AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+    )
+
+
+def base(room_id: int, language_code: str = "en") -> str:
+    """Build the booth-scoped route prefix."""
+    return f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/booths/{language_code}"
+
+
+async def go_live(room_id: int, language_code: str = "en") -> str:
+    """Put the booth in the in-memory registry the way a joining interpreter would."""
+    await booths.create_booth(EVENT_SLUG, language_code, "English", room_id)
+    from portal.booth_identity import make_booth_id
+
+    return make_booth_id(EVENT_SLUG, room_id, language_code)
 
 
 @pytest.mark.anyio
-async def test_start_passes_room_scoped_booth_and_booth_settings(monkeypatch, live_booth, token):
-    """Start builds a room-scoped booth ID and forwards the booth's provider and model."""
+async def test_start_returns_200_and_uses_room_scoped_booth_id(seed, monkeypatch):
+    """Start succeeds and passes the room-scoped ID plus the booth's settings to the worker."""
+    room_id = seed["room_id"]
+    await go_live(room_id)
     started = {}
 
     async def fake_worker(*args, **kwargs):
-        """Record the arguments the endpoint passes to the worker."""
+        """Capture what the route hands the worker."""
         started["args"] = args
         started["kwargs"] = kwargs
 
-    monkeypatch.setattr(api_v1, "start_transcription_worker", fake_worker)
+    monkeypatch.setattr("portal.routers.api_v1.start_transcription_worker", fake_worker)
 
-    result = await api_v1.start_transcription(
-        event_slug=EVENT_SLUG,
-        room_id=ROOM_ID,
-        language_code="en",
-        db=FakeSession(make_event(), make_booth()),
-        token=token,
-    )
+    async with client() as c:
+        resp = await c.post(f"{base(room_id)}/transcription/start")
 
-    assert result == {"status": "started", "booth_id": "pycon2026-14-en"}
-    assert started["args"][:3] == (EVENT_SLUG, "en", "pycon2026-14-en")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "started", "booth_id": f"{EVENT_SLUG}-{room_id}-en"}
+    assert started["args"][:3] == (EVENT_SLUG, "en", f"{EVENT_SLUG}-{room_id}-en")
     assert started["args"][4:6] == ("local", "tiny")
-    assert started["kwargs"] == {"room_id": ROOM_ID}
+    assert started["kwargs"] == {"room_id": room_id}
 
 
 @pytest.mark.anyio
-async def test_start_rejects_booth_missing_from_registry(token):
-    """Start returns 400 when the booth is not live in the registry."""
-    with pytest.raises(HTTPException) as exc:
-        await api_v1.start_transcription(
-            event_slug=EVENT_SLUG,
-            room_id=99,
-            language_code="de",
-            db=FakeSession(make_event()),
-            token=token,
-        )
+async def test_start_returns_400_when_booth_not_live(seed):
+    """A booth absent from the registry is a client error not a 500."""
+    async with client() as c:
+        resp = await c.post(f"{base(seed['room_id'])}/transcription/start")
 
-    assert exc.value.status_code == 400
-    assert "not active" in exc.value.detail
+    assert resp.status_code == 400
+    assert "not active" in resp.json()["detail"]
 
 
 @pytest.mark.anyio
-async def test_start_rejects_booth_with_transcription_disabled(live_booth, token):
-    """Start returns 400 when the booth has transcription switched off."""
-    with pytest.raises(HTTPException) as exc:
-        await api_v1.start_transcription(
-            event_slug=EVENT_SLUG,
-            room_id=ROOM_ID,
-            language_code="en",
-            db=FakeSession(make_event(), make_booth(transcription_enabled=False)),
-            token=token,
-        )
+async def test_start_returns_400_when_transcription_disabled(seed):
+    """A booth with transcription switched off is rejected before the worker is touched."""
+    from portal.database import get_session
+    from portal.models import DBBooth
 
-    assert exc.value.status_code == 400
+    async with get_session() as s:
+        booth = await s.get(DBBooth, seed["booth_id"])
+        booth.transcription_enabled = False
+
+    await go_live(seed["room_id"])
+    async with client() as c:
+        resp = await c.post(f"{base(seed['room_id'])}/transcription/start")
+
+    assert resp.status_code == 400
+    assert "not enabled" in resp.json()["detail"]
 
 
 @pytest.mark.anyio
-async def test_stop_targets_room_scoped_booth(monkeypatch, token):
-    """Stop hands the worker the room-scoped booth ID."""
+async def test_start_returns_400_when_external_provider_has_no_key(seed):
+    """An external provider without an event key is reported rather than started."""
+    from portal.database import get_session
+    from portal.models import DBBooth, Event
+
+    async with get_session() as s:
+        booth = await s.get(DBBooth, seed["booth_id"])
+        booth.transcription_provider = "deepgram"
+        event = await s.get(Event, seed["event_id"])
+        event.transcription_api_enabled = True
+
+    await go_live(seed["room_id"])
+    async with client() as c:
+        resp = await c.post(f"{base(seed['room_id'])}/transcription/start")
+
+    assert resp.status_code == 400
+    assert "API key" in resp.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_start_returns_429_when_worker_pool_is_full(seed, monkeypatch):
+    """The worker's capacity refusal surfaces as 429 not 500."""
+    await go_live(seed["room_id"])
+
+    async def full(*_args, **_kwargs):
+        """Refuse the way the worker does at capacity."""
+        raise ValueError("System at maximum capacity (10 concurrent transcription booths).")
+
+    monkeypatch.setattr("portal.routers.api_v1.start_transcription_worker", full)
+
+    async with client() as c:
+        resp = await c.post(f"{base(seed['room_id'])}/transcription/start")
+
+    assert resp.status_code == 429
+    assert "maximum capacity" in resp.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_stop_returns_200_and_targets_room_scoped_booth(seed, monkeypatch):
+    """Stop succeeds and asks the worker to stop the room-scoped booth."""
+    room_id = seed["room_id"]
     stopped = []
 
     async def fake_stop(booth_id):
-        """Record the booth ID the endpoint asks to stop."""
+        """Record which booth the route stops."""
         stopped.append(booth_id)
 
-    monkeypatch.setattr(api_v1, "stop_transcription_worker", fake_stop)
+    monkeypatch.setattr("portal.routers.api_v1.stop_transcription_worker", fake_stop)
 
-    result = await api_v1.stop_transcription(
-        event_slug=EVENT_SLUG,
-        room_id=ROOM_ID,
-        language_code="en",
-        db=FakeSession(make_event()),
-        token=token,
-    )
+    async with client() as c:
+        resp = await c.post(f"{base(room_id)}/transcription/stop")
 
-    assert stopped == ["pycon2026-14-en"]
-    assert result == {"status": "stopped", "booth_id": "pycon2026-14-en"}
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "stopped", "booth_id": f"{EVENT_SLUG}-{room_id}-en"}
+    assert stopped == [f"{EVENT_SLUG}-{room_id}-en"]
+
+
+@pytest.mark.anyio
+async def test_status_returns_200_and_reports_idle_booth(seed):
+    """Status answers for a live booth with no worker attached."""
+    room_id = seed["room_id"]
+    await go_live(room_id)
+
+    async with client() as c:
+        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "room_id": room_id,
+        "statuses": {"en": {"is_active": True, "transcription_running": False}},
+    }
+
+
+@pytest.mark.anyio
+async def test_status_reports_running_worker(seed):
+    """transcription_running follows active_workers rather than a field nothing sets."""
+    from portal.transcription.worker import active_workers
+
+    room_id = seed["room_id"]
+    booth_id = await go_live(room_id)
+    active_workers[booth_id] = object()
+
+    async with client() as c:
+        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
+
+    assert resp.status_code == 200
+    assert resp.json()["statuses"]["en"]["transcription_running"] is True
+
+
+@pytest.mark.anyio
+async def test_status_reports_booth_that_is_not_live(seed):
+    """A configured but unjoined booth is reported inactive rather than crashing."""
+    room_id = seed["room_id"]
+
+    async with client() as c:
+        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
+
+    assert resp.status_code == 200
+    assert resp.json()["statuses"]["en"] == {"is_active": False, "transcription_running": False}
+
+
+@pytest.mark.anyio
+async def test_routes_reject_unknown_event(seed):
+    """An unknown event slug is a 404 on every route."""
+    room_id = seed["room_id"]
+    async with client() as c:
+        start = await c.post(f"/api/v1/events/nope/rooms/{room_id}/booths/en/transcription/start")
+        stop = await c.post(f"/api/v1/events/nope/rooms/{room_id}/booths/en/transcription/stop")
+        status = await c.get(f"/api/v1/events/nope/rooms/{room_id}/status")
+
+    assert [start.status_code, stop.status_code, status.status_code] == [404, 404, 404]
+
+
+@pytest.mark.anyio
+async def test_routes_reject_missing_token(seed):
+    """Without a bearer token every route is refused."""
+    from httpx import ASGITransport, AsyncClient
+
+    from fastapi_app import app
+
+    room_id = seed["room_id"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        start = await c.post(f"{base(room_id)}/transcription/start")
+        status = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
+
+    assert start.status_code == 401
+    assert status.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_no_transcription_route_returns_5xx(seed):
+    """Guard the original defect: each route answered 500 because it raised TypeError.
+
+    The app is driven with raise_app_exceptions off so an unhandled exception
+    arrives as a 500 instead of propagating into the test, which is how a caller
+    of the API experiences it.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from fastapi_app import app
+
+    room_id = seed["room_id"]
+    await go_live(room_id)
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+    ) as c:
+        responses = {
+            "start": await c.post(f"{base(room_id)}/transcription/start"),
+            "stop": await c.post(f"{base(room_id)}/transcription/stop"),
+            "status": await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status"),
+        }
+
+    assert {name: r.status_code for name, r in responses.items() if r.status_code >= 500} == {}

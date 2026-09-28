@@ -27,7 +27,7 @@ from portal.models import (
 from portal.rate_limit import auth_rate_limiter
 from portal.transcription import ProviderConfig, get_api_key
 from portal.transcription.constants import ProviderEnum
-from portal.transcription.worker import start_transcription_worker, stop_transcription_worker
+from portal.transcription.worker import active_workers, start_transcription_worker, stop_transcription_worker
 from portal.websockets.manager import broadcast_transcription
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,7 @@ def _transcription_settings(event: Event, booth: DBBooth) -> tuple[str, str, Pro
         try:
             api_key = get_api_key(event, provider)
         except ValueError:
+            logger.exception("Could not decrypt the %s key for event %s", provider.value, event.slug)
             raise HTTPException(
                 status_code=400,
                 detail="Stored API key could not be decrypted. Re-enter it in the admin portal.",
@@ -677,6 +678,7 @@ async def start_transcription(
             room_id=room_id,
         )
     except ValueError as exc:
+        logger.warning("Refused to start transcription for %s: %s", booth_id, exc)
         raise HTTPException(status_code=429, detail=str(exc))
 
     return {"status": "started", "booth_id": booth_id}
@@ -710,6 +712,7 @@ async def get_transcription_status(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:read")),
 ):
+    """Report which booths in a room are live and which are transcribing."""
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
@@ -718,16 +721,20 @@ async def get_transcription_status(
     await _verify_token_rbac(db, token, event, room_id)
 
     # Collect statuses for all booths in the room
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id))
+    result = await db.execute(
+        select(DBBooth).where(DBBooth.event_id == event.id, DBBooth.room_id == room_id)
+    )
     booths_list = result.scalars().all()
 
     statuses = {}
     for b in booths_list:
-        bid = make_booth_id(event_slug, b.language_code)
-        booth = booths.get(bid)
+        bid = make_booth_id(event_slug, room_id, b.language_code)
+        booth = booths.get_booth_sync(bid)
+        # active_workers is the registry the worker's own start and stop maintain,
+        # so it is the only reliable source for whether transcription is running.
         statuses[b.language_code] = {
-            "is_active": bool(booth),
-            "transcription_running": bool(booth and getattr(booth, "transcription_task", None)),
+            "is_active": booth is not None,
+            "transcription_running": bid in active_workers,
         }
 
     return {"room_id": room_id, "statuses": statuses}
