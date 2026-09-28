@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 os.environ["BOOTH_ACCESS_TOKEN"] = ""
 
@@ -264,20 +265,45 @@ async def test_status_returns_200_and_reports_idle_booth(seed):
     }
 
 
+def fake_session(state):
+    """A stand-in worker session carrying just the state the status route reads."""
+    return SimpleNamespace(state=state)
+
+
 @pytest.mark.anyio
 async def test_status_reports_running_worker(seed):
     """transcription_running follows active_workers rather than a field nothing sets."""
-    from portal.transcription.worker import active_workers
+    from portal.transcription.worker import State, active_workers
 
     room_id = seed["room_id"]
     booth_id = await go_live(room_id)
-    active_workers[booth_id] = object()
+    active_workers[booth_id] = fake_session(State.RUNNING)
 
     async with client() as c:
         resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
 
     assert resp.status_code == 200
     assert resp.json()["statuses"]["en"]["transcription_running"] is True
+
+
+@pytest.mark.anyio
+async def test_status_does_not_report_a_stopped_session_as_running(seed):
+    """A session whose task exited stays in active_workers until the next start or stop.
+
+    Its state is STOPPED, so the route must not report it as running on the
+    strength of registry membership alone.
+    """
+    from portal.transcription.worker import State, active_workers
+
+    room_id = seed["room_id"]
+    booth_id = await go_live(room_id)
+    active_workers[booth_id] = fake_session(State.STOPPED)
+
+    async with client() as c:
+        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
+
+    assert resp.status_code == 200
+    assert resp.json()["statuses"]["en"]["transcription_running"] is False
 
 
 @pytest.mark.anyio

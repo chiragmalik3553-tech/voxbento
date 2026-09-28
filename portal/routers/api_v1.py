@@ -27,7 +27,12 @@ from portal.models import (
 from portal.rate_limit import auth_rate_limiter
 from portal.transcription import ProviderConfig, get_api_key
 from portal.transcription.constants import ProviderEnum
-from portal.transcription.worker import active_workers, start_transcription_worker, stop_transcription_worker
+from portal.transcription.worker import (
+    State,
+    active_workers,
+    start_transcription_worker,
+    stop_transcription_worker,
+)
 from portal.websockets.manager import broadcast_transcription
 
 logger = logging.getLogger(__name__)
@@ -730,11 +735,13 @@ async def get_transcription_status(
     for b in booths_list:
         bid = make_booth_id(event_slug, room_id, b.language_code)
         booth = booths.get_booth_sync(bid)
-        # active_workers is the registry the worker's own start and stop maintain,
-        # so it is the only reliable source for whether transcription is running.
+        # A session whose task has exited sets its own state to STOPPED but stays
+        # in active_workers until the next start or stop, so membership alone
+        # would keep reporting a dead worker as running.
+        session = active_workers.get(bid)
         statuses[b.language_code] = {
             "is_active": booth is not None,
-            "transcription_running": bid in active_workers,
+            "transcription_running": session is not None and session.state is not State.STOPPED,
         }
 
     return {"room_id": room_id, "statuses": statuses}
