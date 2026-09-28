@@ -643,6 +643,7 @@ async def start_transcription(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:manage")),
 ):
+    """Start the transcription worker for a live booth."""
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
@@ -689,6 +690,7 @@ async def stop_transcription(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:manage")),
 ):
+    """Stop the transcription worker for a booth."""
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
