@@ -497,6 +497,7 @@ def test_ws_join_ignores_client_supplied_participant_id():
             state = joined_b["state"]
             names = {p["participant_id"]: p["display_name"] for p in state["participants"]}
             assert joined_b["participant_id"] != pid_a
+            assert names[joined_b["participant_id"]] == "Bob"
             assert names[pid_a] == "Alice"
             assert state["active_interpreter_id"] == pid_a
 
