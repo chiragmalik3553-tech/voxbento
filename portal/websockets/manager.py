@@ -165,9 +165,11 @@ async def _handle_join(ws: WebSocket, session: Session, data: dict) -> None:
         await ws.send_text(json.dumps({"type": "booth:error", "message": "No role assigned for this session."}))
         return
     display_name = data.get("display_name", "Interpreter")
-    # Role and participant id belong to the session -- both are derived from the
-    # bearer cookie when the socket connects -- so the "role" and
+    # Role and participant id both belong to the session, so the "role" and
     # "participant_id" fields of the client message are ignored, not validated.
+    # granted_role is resolved from the cookie or ?token= at connect time;
+    # participant_id is None until join_participant mints one below, after which
+    # it stays on the session so a rejoin on this socket keeps the same id.
     role = session.granted_role
     participant_id = session.participant_id
     language = data.get("language", session.language)
