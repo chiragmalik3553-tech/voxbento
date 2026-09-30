@@ -27,12 +27,7 @@ from portal.models import (
 from portal.rate_limit import auth_rate_limiter
 from portal.transcription import ProviderConfig, get_api_key
 from portal.transcription.constants import ProviderEnum
-from portal.transcription.worker import (
-    State,
-    active_workers,
-    start_transcription_worker,
-    stop_transcription_worker,
-)
+from portal.transcription.worker import start_transcription_worker, stop_transcription_worker
 from portal.websockets.manager import broadcast_transcription
 
 logger = logging.getLogger(__name__)
@@ -697,7 +692,6 @@ async def stop_transcription(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:manage")),
 ):
-    """Stop the transcription worker for a booth."""
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
@@ -705,7 +699,7 @@ async def stop_transcription(
 
     await _verify_token_rbac(db, token, event, room_id)
 
-    booth_id = make_booth_id(event_slug, room_id, language_code)
+    booth_id = make_booth_id(event_slug, language_code)
     await stop_transcription_worker(booth_id)
     return {"status": "stopped", "booth_id": booth_id}
 
@@ -717,7 +711,6 @@ async def get_transcription_status(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:read")),
 ):
-    """Report which booths in a room are live and which are transcribing."""
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
@@ -726,22 +719,16 @@ async def get_transcription_status(
     await _verify_token_rbac(db, token, event, room_id)
 
     # Collect statuses for all booths in the room
-    result = await db.execute(
-        select(DBBooth).where(DBBooth.event_id == event.id, DBBooth.room_id == room_id)
-    )
+    result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id))
     booths_list = result.scalars().all()
 
     statuses = {}
     for b in booths_list:
-        bid = make_booth_id(event_slug, room_id, b.language_code)
-        booth = booths.get_booth_sync(bid)
-        # A session whose task has exited sets its own state to STOPPED but stays
-        # in active_workers until the next start or stop, so membership alone
-        # would keep reporting a dead worker as running.
-        session = active_workers.get(bid)
+        bid = make_booth_id(event_slug, b.language_code)
+        booth = booths.get(bid)
         statuses[b.language_code] = {
-            "is_active": booth is not None,
-            "transcription_running": session is not None and session.state is not State.STOPPED,
+            "is_active": bool(booth),
+            "transcription_running": bool(booth and getattr(booth, "transcription_task", None)),
         }
 
     return {"room_id": room_id, "statuses": statuses}

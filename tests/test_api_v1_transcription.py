@@ -1,16 +1,16 @@
 """
-Tests for the /api/v1 transcription control routes.
+Tests for the /api/v1 transcription start route.
 
-Every request to start, stop and status used to fail with a TypeError and come
-back as a 500, so each route is driven over HTTP here and asserted on its
-status code.
+Every request used to fail with a TypeError and come back as a 500, so the route
+is driven over HTTP here and asserted on its status code.
+
+Stop and status are covered by #508.
 
 Covers:
 - Start returns 200 and hands the worker a room-scoped booth ID
 - Start rejects a booth that is not live, not enabled or missing a key
-- Stop returns 200 and targets the room-scoped booth
-- Status reports liveness and whether a worker is actually running
-- Event scoping and RBAC on all three routes
+- A full worker pool is a 429
+- Unknown event, missing token, and no 5xx under any of them
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from __future__ import annotations
 import hashlib
 import os
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 os.environ["BOOTH_ACCESS_TOKEN"] = ""
 
@@ -230,125 +229,30 @@ async def test_start_returns_429_when_worker_pool_is_full(seed, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_stop_returns_200_and_targets_room_scoped_booth(seed, monkeypatch):
-    """Stop succeeds and asks the worker to stop the room-scoped booth."""
-    room_id = seed["room_id"]
-    stopped = []
-
-    async def fake_stop(booth_id):
-        """Record which booth the route stops."""
-        stopped.append(booth_id)
-
-    monkeypatch.setattr("portal.routers.api_v1.stop_transcription_worker", fake_stop)
-
+async def test_start_rejects_unknown_event(seed):
+    """An unknown event slug is a 404 rather than a crash."""
     async with client() as c:
-        resp = await c.post(f"{base(room_id)}/transcription/stop")
+        resp = await c.post(f"/api/v1/events/nope/rooms/{seed['room_id']}/booths/en/transcription/start")
 
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "stopped", "booth_id": f"{EVENT_SLUG}-{room_id}-en"}
-    assert stopped == [f"{EVENT_SLUG}-{room_id}-en"]
+    assert resp.status_code == 404
 
 
 @pytest.mark.anyio
-async def test_status_returns_200_and_reports_idle_booth(seed):
-    """Status answers for a live booth with no worker attached."""
-    room_id = seed["room_id"]
-    await go_live(room_id)
-
-    async with client() as c:
-        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
-
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "room_id": room_id,
-        "statuses": {"en": {"is_active": True, "transcription_running": False}},
-    }
-
-
-def fake_session(state):
-    """A stand-in worker session carrying just the state the status route reads."""
-    return SimpleNamespace(state=state)
-
-
-@pytest.mark.anyio
-async def test_status_reports_running_worker(seed):
-    """transcription_running follows active_workers rather than a field nothing sets."""
-    from portal.transcription.worker import State, active_workers
-
-    room_id = seed["room_id"]
-    booth_id = await go_live(room_id)
-    active_workers[booth_id] = fake_session(State.RUNNING)
-
-    async with client() as c:
-        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
-
-    assert resp.status_code == 200
-    assert resp.json()["statuses"]["en"]["transcription_running"] is True
-
-
-@pytest.mark.anyio
-async def test_status_does_not_report_a_stopped_session_as_running(seed):
-    """A session whose task exited stays in active_workers until the next start or stop.
-
-    Its state is STOPPED, so the route must not report it as running on the
-    strength of registry membership alone.
-    """
-    from portal.transcription.worker import State, active_workers
-
-    room_id = seed["room_id"]
-    booth_id = await go_live(room_id)
-    active_workers[booth_id] = fake_session(State.STOPPED)
-
-    async with client() as c:
-        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
-
-    assert resp.status_code == 200
-    assert resp.json()["statuses"]["en"]["transcription_running"] is False
-
-
-@pytest.mark.anyio
-async def test_status_reports_booth_that_is_not_live(seed):
-    """A configured but unjoined booth is reported inactive rather than crashing."""
-    room_id = seed["room_id"]
-
-    async with client() as c:
-        resp = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
-
-    assert resp.status_code == 200
-    assert resp.json()["statuses"]["en"] == {"is_active": False, "transcription_running": False}
-
-
-@pytest.mark.anyio
-async def test_routes_reject_unknown_event(seed):
-    """An unknown event slug is a 404 on every route."""
-    room_id = seed["room_id"]
-    async with client() as c:
-        start = await c.post(f"/api/v1/events/nope/rooms/{room_id}/booths/en/transcription/start")
-        stop = await c.post(f"/api/v1/events/nope/rooms/{room_id}/booths/en/transcription/stop")
-        status = await c.get(f"/api/v1/events/nope/rooms/{room_id}/status")
-
-    assert [start.status_code, stop.status_code, status.status_code] == [404, 404, 404]
-
-
-@pytest.mark.anyio
-async def test_routes_reject_missing_token(seed):
-    """Without a bearer token every route is refused."""
+async def test_start_rejects_missing_token(seed):
+    """Without a bearer token the route is refused."""
     from httpx import ASGITransport, AsyncClient
 
     from fastapi_app import app
 
-    room_id = seed["room_id"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        start = await c.post(f"{base(room_id)}/transcription/start")
-        status = await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status")
+        resp = await c.post(f"{base(seed['room_id'])}/transcription/start")
 
-    assert start.status_code == 401
-    assert status.status_code == 401
+    assert resp.status_code == 401
 
 
 @pytest.mark.anyio
-async def test_no_transcription_route_returns_5xx(seed):
-    """Guard the original defect: each route answered 500 because it raised TypeError.
+async def test_start_never_returns_5xx(seed):
+    """Guard the original defect: start answered 500 because it raised TypeError.
 
     The app is driven with raise_app_exceptions off so an unhandled exception
     arrives as a 500 instead of propagating into the test, which is how a caller
@@ -360,17 +264,12 @@ async def test_no_transcription_route_returns_5xx(seed):
 
     room_id = seed["room_id"]
     await go_live(room_id)
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
 
     async with AsyncClient(
-        transport=transport,
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://test",
         headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
     ) as c:
-        responses = {
-            "start": await c.post(f"{base(room_id)}/transcription/start"),
-            "stop": await c.post(f"{base(room_id)}/transcription/stop"),
-            "status": await c.get(f"/api/v1/events/{EVENT_SLUG}/rooms/{room_id}/status"),
-        }
+        resp = await c.post(f"{base(room_id)}/transcription/start")
 
-    assert {name: r.status_code for name, r in responses.items() if r.status_code >= 500} == {}
+    assert resp.status_code < 500
